@@ -28,6 +28,7 @@ INPUT_CSV = "queries.csv"
 CHATGPT_MODEL = os.environ.get("CHATGPT_MODEL", "gpt-5.2")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
 JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "gpt-4o")
+RUNS = int(os.environ.get("GEO_RUNS", "1"))
 
 RAW_OUTPUTS = {
     "high": "high_funnel_responses.csv",
@@ -50,6 +51,12 @@ EVAL_OUTPUTS = {
     "low": "geo_eval_results_low.csv",
 }
 
+EVAL_PER_RUN_OUTPUTS = {
+    "combined": "geo_eval_results_combined_per_run.csv",
+    "high": "geo_eval_results_high_per_run.csv",
+    "mid": "geo_eval_results_mid_per_run.csv",
+    "low": "geo_eval_results_low_per_run.csv",
+}
 POSITION_LAMBDA = 0.3
 
 
@@ -177,6 +184,7 @@ def _raw_key(row: dict) -> tuple:
         str(row.get("addition", "")).strip(),
         str(row.get("geography", "")).strip(),
         str(row.get("funnel", "")).strip(),
+        str(row.get("run_id", "")).strip(),
     )
 
 
@@ -196,6 +204,7 @@ def _load_existing_raw_keys(output_file: str) -> set[tuple]:
                 str(r.get("addition", "")).strip(),
                 str(r.get("geography", "")).strip(),
                 str(r.get("funnel", "")).strip(),
+                str(r.get("run_id", "")).strip(),
             )
         )
     return keys
@@ -217,6 +226,7 @@ def process_funnel(
             writer.writerow(
                 [
                     "timestamp",
+                    "run_id",
                     "category",
                     "funnel",
                     "geography",
@@ -248,6 +258,7 @@ def process_funnel(
             writer.writerow(
                 [
                     datetime.utcnow().isoformat(),
+                    row.get("run_id", ""),
                     row["category"],
                     row["funnel"],
                     row["geography"],
@@ -269,9 +280,18 @@ def generate_raw_responses():
     openai_client, gemini_client, _ = get_clients()
     funnels = load_queries(INPUT_CSV)
 
-    process_funnel("High", funnels["high"], RAW_OUTPUTS["high"], openai_client, gemini_client)
-    process_funnel("Mid", funnels["mid"], RAW_OUTPUTS["mid"], openai_client, gemini_client)
-    process_funnel("Low", funnels["low"], RAW_OUTPUTS["low"], openai_client, gemini_client)
+    # Duplicate each prompt N times to capture answer variability.
+    for run_id in range(1, RUNS + 1):
+        for funnel_key, funnel_label in [("high", "High"), ("mid", "Mid"), ("low", "Low")]:
+            for row in funnels[funnel_key]:
+                row["run_id"] = run_id
+            process_funnel(
+                funnel_label,
+                funnels[funnel_key],
+                RAW_OUTPUTS[funnel_key],
+                openai_client,
+                gemini_client,
+            )
 
     combined = []
     for key in ["high", "mid", "low"]:
@@ -300,6 +320,23 @@ def domain_from_url(url: str) -> str:
         return ""
 
 
+def extract_source_snippet(answer: str, url: str, window_words: int = 25) -> str:
+    # Pull a small window of words around the URL to approximate the cited snippet.
+    if not answer or not url:
+        return ""
+    tokens = answer.split()
+    idx = None
+    for i, tok in enumerate(tokens):
+        if url in tok:
+            idx = i
+            break
+    if idx is None:
+        return ""
+    start = max(0, idx - window_words)
+    end = min(len(tokens), idx + window_words + 1)
+    return " ".join(tokens[start:end])
+
+
 def process_funnel_data(df_funnel: pd.DataFrame, funnel_name: str | None = None) -> pd.DataFrame:
     # Convert raw responses into per-source rows for scoring.
     if funnel_name:
@@ -318,12 +355,14 @@ def process_funnel_data(df_funnel: pd.DataFrame, funnel_name: str | None = None)
             if not urls:
                 rows.append(
                     {
+                        "RunId": r.get("run_id", ""),
                         "Funnel": r.get("funnel", ""),
                         "Geography": r.get("geography", ""),
                         "Category": r.get("category", ""),
                         "Prompt": r.get("original_query", ""),
                         "Full_Prompt": r.get("full_query", ""),
                         "Answer": chatgpt_response,
+                        "SourceSnippet": "",
                         "Model": "chatgpt",
                         "Source": "",
                         "Citation": "",
@@ -332,14 +371,17 @@ def process_funnel_data(df_funnel: pd.DataFrame, funnel_name: str | None = None)
                 )
             else:
                 for i, url in enumerate(urls, start=1):
+                    snippet = extract_source_snippet(chatgpt_response, url)
                     rows.append(
                         {
+                            "RunId": r.get("run_id", ""),
                             "Funnel": r.get("funnel", ""),
                             "Geography": r.get("geography", ""),
                             "Category": r.get("category", ""),
                             "Prompt": r.get("original_query", ""),
                             "Full_Prompt": r.get("full_query", ""),
                             "Answer": chatgpt_response,
+                            "SourceSnippet": snippet,
                             "Model": "chatgpt",
                             "Source": domain_from_url(url),
                             "Citation": f"[{i}]",
@@ -352,12 +394,14 @@ def process_funnel_data(df_funnel: pd.DataFrame, funnel_name: str | None = None)
             if not urls:
                 rows.append(
                     {
+                        "RunId": r.get("run_id", ""),
                         "Funnel": r.get("funnel", ""),
                         "Geography": r.get("geography", ""),
                         "Category": r.get("category", ""),
                         "Prompt": r.get("original_query", ""),
                         "Full_Prompt": r.get("full_query", ""),
                         "Answer": gemini_response,
+                        "SourceSnippet": "",
                         "Model": "gemini",
                         "Source": "",
                         "Citation": "",
@@ -366,14 +410,17 @@ def process_funnel_data(df_funnel: pd.DataFrame, funnel_name: str | None = None)
                 )
             else:
                 for i, url in enumerate(urls, start=1):
+                    snippet = extract_source_snippet(gemini_response, url)
                     rows.append(
                         {
+                            "RunId": r.get("run_id", ""),
                             "Funnel": r.get("funnel", ""),
                             "Geography": r.get("geography", ""),
                             "Category": r.get("category", ""),
                             "Prompt": r.get("original_query", ""),
                             "Full_Prompt": r.get("full_query", ""),
                             "Answer": gemini_response,
+                            "SourceSnippet": snippet,
                             "Model": "gemini",
                             "Source": domain_from_url(url),
                             "Citation": f"[{i}]",
@@ -407,6 +454,7 @@ def build_table_views():
     combined_out = process_funnel_data(combined_df, "Combined")
 
     output_columns = [
+        "RunId",
         "Funnel",
         "Geography",
         "Category",
@@ -414,6 +462,7 @@ def build_table_views():
         "Full_Prompt",
         "Model",
         "Answer",
+        "SourceSnippet",
         "Source",
         "Citation",
         "URL",
@@ -516,6 +565,14 @@ def word_count(text: str) -> int:
     return len(text.split())
 
 
+def effective_source_text(row: pd.Series) -> str:
+    # Prefer source snippet when available; otherwise return empty to avoid counting full answer.
+    snippet = row.get("SourceSnippet", "")
+    if isinstance(snippet, str) and snippet.strip():
+        return snippet
+    return ""
+
+
 def parse_citation_position(citation: str) -> int:
     # Objective metric: where the citation appears in the answer.
     if not isinstance(citation, str):
@@ -534,7 +591,10 @@ def position_weight(position: int) -> float:
 def add_objective_metrics(df: pd.DataFrame) -> pd.DataFrame:
     # Add objective metrics and normalize them.
     df = df.copy()
-    df["WordCount"] = df["Answer"].apply(word_count)
+    if "SourceSnippet" in df.columns:
+        df["WordCount"] = df.apply(lambda r: word_count(effective_source_text(r)), axis=1)
+    else:
+        df["WordCount"] = df["Answer"].apply(word_count)
     df["CitationPosition"] = df["Citation"].apply(parse_citation_position)
     df["PositionWeight"] = df["CitationPosition"].apply(position_weight)
     df["PAWordCount"] = df["WordCount"] * df["PositionWeight"]
@@ -543,6 +603,15 @@ def add_objective_metrics(df: pd.DataFrame) -> pd.DataFrame:
         mn, mx = df[col].min(), df[col].max()
         df[col + "_Norm"] = (df[col] - mn) / (mx - mn) if mx > mn else 0.0
 
+    return df
+
+
+def add_objective_norms(df: pd.DataFrame) -> pd.DataFrame:
+    # Normalize objective metrics on an aggregated dataframe.
+    df = df.copy()
+    for col in ["WordCount", "PositionWeight", "PAWordCount"]:
+        mn, mx = df[col].min(), df[col].max()
+        df[col + "_Norm"] = (df[col] - mn) / (mx - mn) if mx > mn else 0.0
     return df
 
 
@@ -577,7 +646,16 @@ def judge_row(client: OpenAI, row: pd.Series) -> dict:
 
     try:
         raw = retry_call(_call)
-        return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except Exception:
+            # Attempt to salvage JSON if the model added extra text.
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return json.loads(raw[start : end + 1])
+            logging.warning("Judge returned non-JSON. Defaulting to zeros.")
+            return {k: 0 for k in SUBJECTIVE_KEYS}
     except Exception:
         return {k: 0 for k in SUBJECTIVE_KEYS}
 
@@ -650,6 +728,7 @@ def _eval_key(row: dict) -> tuple:
         str(row.get("URL", "")).strip(),
         str(row.get("Model", "")).strip(),
         str(row.get("Funnel", "")).strip(),
+        str(row.get("RunId", "")).strip(),
     )
 
 
@@ -670,6 +749,7 @@ def _load_existing_eval_keys(output_file: str) -> set[tuple]:
                 str(r.get("URL", "")).strip(),
                 str(r.get("Model", "")).strip(),
                 str(r.get("Funnel", "")).strip(),
+                str(r.get("RunId", "")).strip(),
             )
         )
     return keys
@@ -680,13 +760,13 @@ def run_judging():
     _, _, judge_client = get_clients()
 
     file_pairs = [
-        (TABLE_OUTPUTS["combined"], EVAL_OUTPUTS["combined"], "Combined"),
-        (TABLE_OUTPUTS["high"], EVAL_OUTPUTS["high"], "High Funnel"),
-        (TABLE_OUTPUTS["mid"], EVAL_OUTPUTS["mid"], "Mid Funnel"),
-        (TABLE_OUTPUTS["low"], EVAL_OUTPUTS["low"], "Low Funnel"),
+        (TABLE_OUTPUTS["combined"], EVAL_OUTPUTS["combined"], EVAL_PER_RUN_OUTPUTS["combined"], "Combined"),
+        (TABLE_OUTPUTS["high"], EVAL_OUTPUTS["high"], EVAL_PER_RUN_OUTPUTS["high"], "High Funnel"),
+        (TABLE_OUTPUTS["mid"], EVAL_OUTPUTS["mid"], EVAL_PER_RUN_OUTPUTS["mid"], "Mid Funnel"),
+        (TABLE_OUTPUTS["low"], EVAL_OUTPUTS["low"], EVAL_PER_RUN_OUTPUTS["low"], "Low Funnel"),
     ]
 
-    for input_file, output_file, name in file_pairs:
+    for input_file, output_file, per_run_output, name in file_pairs:
         if not os.path.exists(input_file):
             logging.warning("Skipping %s (not found)", input_file)
             continue
@@ -696,7 +776,7 @@ def run_judging():
         logging.info("Loaded %s rows", len(df))
 
         # Skip already-judged rows to minimize API calls.
-        existing_keys = _load_existing_eval_keys(output_file)
+        existing_keys = _load_existing_eval_keys(per_run_output) if per_run_output else set()
         if existing_keys:
             before = len(df)
             df = df[~df.apply(lambda r: _eval_key(r), axis=1).isin(existing_keys)]
@@ -709,12 +789,47 @@ def run_judging():
         df = add_objective_metrics(df)
         df = add_subjective_metrics(df, judge_client)
 
-        # If we skipped rows earlier, append to existing output to preserve full history.
-        if os.path.exists(output_file):
-            existing = pd.read_csv(output_file)
-            df = pd.concat([existing, df], ignore_index=True)
+        # Persist per-run judgments for caching.
+        if per_run_output:
+            if os.path.exists(per_run_output):
+                existing_per_run = pd.read_csv(per_run_output)
+                df = pd.concat([existing_per_run, df], ignore_index=True)
+            df.to_csv(per_run_output, index=False)
+            logging.info("Saved per-run judgments to %s", per_run_output)
 
-        export_to_csv(df, output_file, name)
+        # Aggregate across runs and compute averaged scores.
+        group_cols = [
+            "Funnel",
+            "Geography",
+            "Category",
+            "Prompt",
+            "Full_Prompt",
+            "Model",
+            "Source",
+            "Citation",
+            "URL",
+        ]
+        agg_cols = [
+            "WordCount",
+            "PositionWeight",
+            "PAWordCount",
+            "diversity",
+            "follow",
+            "influence",
+            "relevance",
+            "subjcount",
+            "subjpos",
+            "uniqueness",
+            "SubjectiveImpressions",
+        ]
+
+        avg_df = df.groupby(group_cols, dropna=False)[agg_cols].mean().reset_index()
+        avg_df["RunCount"] = df.groupby(group_cols, dropna=False).size().values
+
+        # Normalize objective metrics on averaged data.
+        avg_df = add_objective_norms(avg_df)
+
+        export_to_csv(avg_df, output_file, name)
 
 
 def run_all():
