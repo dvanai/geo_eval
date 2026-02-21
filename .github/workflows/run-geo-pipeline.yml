@@ -28,6 +28,7 @@ jobs:
           CHATGPT_MODEL: gpt-5.2
           GEMINI_MODEL: gemini-3-flash-preview
           JUDGE_MODEL: gpt-4o
+          GEO_RUNS: "1"
         run: |
           python geo_pipeline.py
 
@@ -52,3 +53,19 @@ jobs:
             geo_eval_results_high_summary.csv
             geo_eval_results_mid_summary.csv
             geo_eval_results_low_summary.csv
+            geo_eval_results_combined_per_run.csv
+            geo_eval_results_high_per_run.csv
+            geo_eval_results_mid_per_run.csv
+            geo_eval_results_low_per_run.csv
+            geo_response_eval_combined.csv
+            geo_response_eval_high.csv
+            geo_response_eval_mid.csv
+            geo_response_eval_low.csv
+            geo_response_eval_combined_summary.csv
+            geo_response_eval_high_summary.csv
+            geo_response_eval_mid_summary.csv
+            geo_response_eval_low_summary.csv
+            geo_response_eval_combined_per_run.csv
+            geo_response_eval_high_per_run.csv
+            geo_response_eval_mid_per_run.csv
+            geo_response_eval_low_per_run.csv
