@@ -57,6 +57,20 @@ EVAL_PER_RUN_OUTPUTS = {
     "mid": "geo_eval_results_mid_per_run.csv",
     "low": "geo_eval_results_low_per_run.csv",
 }
+
+RESPONSE_EVAL_OUTPUTS = {
+    "combined": "geo_response_eval_combined.csv",
+    "high": "geo_response_eval_high.csv",
+    "mid": "geo_response_eval_mid.csv",
+    "low": "geo_response_eval_low.csv",
+}
+
+RESPONSE_EVAL_PER_RUN_OUTPUTS = {
+    "combined": "geo_response_eval_combined_per_run.csv",
+    "high": "geo_response_eval_high_per_run.csv",
+    "mid": "geo_response_eval_mid_per_run.csv",
+    "low": "geo_response_eval_low_per_run.csv",
+}
 POSITION_LAMBDA = 0.3
 
 
@@ -501,6 +515,12 @@ SUBJECTIVE_KEYS = [
     "uniqueness",
 ]
 
+RESPONSE_KEYS = [
+    "sentiment",
+    "specificity",
+    "brand_alignment",
+]
+
 RUBRIC_TEXT = """
 You are evaluating how a single citation (Source [x]) contributes to a large language model answer.
 
@@ -554,6 +574,43 @@ Return ONLY a valid JSON object with this exact schema and no extra commentary:
   "subjcount": 0,
   "subjpos": 0,
   "uniqueness": 0
+}
+"""
+
+RESPONSE_RUBRIC_TEXT = """
+You are evaluating the overall response quality for Destination Vancouver. This is NOT about citations.
+
+Rate the response on three metrics from 0 to 5 (integers only):
+1) Sentiment (sentiment)
+Definition: How warm, compelling, and emotionally positive is the tone when Vancouver is mentioned?
+5 – Vancouver is mentioned and tone is very warm, vivid, and inviting. Vancouver is framed as inspiring, refreshing, or energizing.
+4 – Vancouver is mentioned and tone is positive; Vancouver is recommended but framed more functionally or grouped with peers.
+3 – Vancouver is mentioned and tone is neutral or factual; Vancouver is mentioned without emotional pull.
+2 – Vancouver is mentioned, but described inaccurately, dismissively, or in a way that conflicts with brand values.
+1 – Vancouver is not mentioned.
+
+2) Specificity (specificity)
+Definition: Does the response reference real, specific Vancouver places, neighbourhoods, events, or experiences?
+5 – Vancouver is mentioned and there are multiple specific and accurate Vancouver references made (e.g., Stanley Park, cherry blossoms in Queen Elizabeth Park, neighbourhoods, Michelin restaurants).
+4 – Vancouver is mentioned and there is at least one specific Vancouver place, experience, or neighbourhood is named.
+3 – Vancouver is mentioned generally, without concrete detail.
+2 – Vancouver is mentioned but information is inaccurate.
+1 – Vancouver is not mentioned.
+
+3) Brand Alignment (brand_alignment)
+Definition: How well does the response reflect Destination Vancouver’s brand?
+Brand pillars: Effortless, Embracing, Energizing, Fresh, Immersive Outdoors, Converging Cultures, Fresh perspectives, Wellbeing, Invigoration, Nature/Proximity of City to Nature, Culinary, Wellness, Major Events, Unique Neighbourhoods, Arts and Culture.
+5 – Vancouver is mentioned and one or more of the above brand pillars are clearly reflected.
+4 – Vancouver is mentioned and brand themes are touched indirectly.
+3 – Vancouver is mentioned, but brand pillars are not evident.
+2 – Vancouver is mentioned but themes are misaligned with our brand.
+1 – Vancouver is not mentioned.
+
+Return ONLY a valid JSON object with this exact schema and no extra commentary:
+{
+  "sentiment": 0,
+  "specificity": 0,
+  "brand_alignment": 0
 }
 """
 
@@ -628,6 +685,16 @@ Source {citation} with URL: {row['URL']}
 {RUBRIC_TEXT}
 """
 
+def build_response_judge_prompt(row: pd.Series) -> str:
+    # Construct the judge prompt for overall response scoring.
+    return f"""
+User query: "{row['Prompt']}"
+
+Generated answer: "{row['Answer']}"
+
+{RESPONSE_RUBRIC_TEXT}
+"""
+
 
 def judge_row(client: OpenAI, row: pd.Series) -> dict:
     # Call the judge model and parse its JSON response.
@@ -659,6 +726,35 @@ def judge_row(client: OpenAI, row: pd.Series) -> dict:
     except Exception:
         return {k: 0 for k in SUBJECTIVE_KEYS}
 
+def judge_response_row(client: OpenAI, row: pd.Series) -> dict:
+    # Call the judge model for overall response scoring and parse its JSON response.
+    prompt_text = build_response_judge_prompt(row)
+
+    def _call():
+        resp = client.chat.completions.create(
+            model=JUDGE_MODEL,
+            temperature=0.0,
+            messages=[
+                {"role": "system", "content": "Return ONLY valid JSON. No explanations."},
+                {"role": "user", "content": prompt_text},
+            ],
+        )
+        return resp.choices[0].message.content.strip()
+
+    try:
+        raw = retry_call(_call)
+        try:
+            return json.loads(raw)
+        except Exception:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return json.loads(raw[start : end + 1])
+            logging.warning("Judge returned non-JSON. Defaulting to zeros.")
+            return {k: 0 for k in RESPONSE_KEYS}
+    except Exception:
+        return {k: 0 for k in RESPONSE_KEYS}
+
 
 def add_subjective_metrics(df: pd.DataFrame, judge_client: OpenAI) -> pd.DataFrame:
     # Add subjective metrics from judge model outputs.
@@ -685,6 +781,40 @@ def add_subjective_metrics(df: pd.DataFrame, judge_client: OpenAI) -> pd.DataFra
     for k in SUBJECTIVE_KEYS:
         df[k] = subj_cols[k]
     df["SubjectiveImpressions"] = subj_avg
+    return df
+
+def count_vancouver_mentions(text: str) -> int:
+    if not isinstance(text, str) or not text:
+        return 0
+    return len(re.findall(r"\bvancouver\b", text, flags=re.IGNORECASE))
+
+
+def add_response_metrics(df: pd.DataFrame, judge_client: OpenAI) -> pd.DataFrame:
+    # Add response-level metrics (brand-focused) from judge model outputs.
+    df = df.copy()
+    cols = {k: [] for k in RESPONSE_KEYS}
+    avg_scores = []
+
+    logging.info("Judging %s responses with %s...", len(df), JUDGE_MODEL)
+    for i, (_, row) in enumerate(df.iterrows(), 1):
+        if i % 50 == 0:
+            logging.info("Processed %s/%s responses", i, len(df))
+
+        scores = judge_response_row(judge_client, row)
+        vals = []
+        for k in RESPONSE_KEYS:
+            v = scores.get(k, 0)
+            if not isinstance(v, (int, float)):
+                v = 0
+            v = max(0, min(5, int(v)))
+            cols[k].append(v)
+            vals.append(v)
+        avg_scores.append(sum(vals) / len(RESPONSE_KEYS))
+
+    for k in RESPONSE_KEYS:
+        df[k] = cols[k]
+    df["ResponseScoreAvg"] = avg_scores
+    df["VancouverMentions"] = df["Answer"].apply(count_vancouver_mentions)
     return df
 
 
@@ -717,6 +847,29 @@ def export_to_csv(df: pd.DataFrame, path: str, dataset_name: str):
 
     logging.info("Saved %s rows to %s (%s)", len(df), path, dataset_name)
     logging.info("Saved summary to %s", summary_path)
+
+
+def export_response_csv(df: pd.DataFrame, path: str, dataset_name: str):
+    # Write response-level evaluation CSV and summary CSV.
+    df = df.copy()
+
+    summary = (
+        df.groupby(["Funnel", "Model"])
+        .agg(
+            Count=("Answer", "size"),
+            AvgResponseScore=("ResponseScoreAvg", "mean"),
+            AvgVancouverMentions=("VancouverMentions", "mean"),
+        )
+        .round(3)
+        .reset_index()
+    )
+
+    df.to_csv(path, index=False)
+    summary_path = os.path.splitext(path)[0] + "_summary.csv"
+    summary.to_csv(summary_path, index=False)
+
+    logging.info("Saved %s rows to %s (%s)", len(df), path, dataset_name)
+    logging.info("Saved response summary to %s", summary_path)
 
 
 def _eval_key(row: dict) -> tuple:
@@ -832,11 +985,138 @@ def run_judging():
         export_to_csv(avg_df, output_file, name)
 
 
+def _response_key(row: dict) -> tuple:
+    return (
+        str(row.get("Prompt", "")).strip(),
+        str(row.get("Answer", "")).strip(),
+        str(row.get("Model", "")).strip(),
+        str(row.get("Funnel", "")).strip(),
+        str(row.get("RunId", "")).strip(),
+    )
+
+
+def _load_existing_response_keys(output_file: str) -> set[tuple]:
+    if not os.path.exists(output_file):
+        return set()
+    try:
+        df = pd.read_csv(output_file)
+    except Exception:
+        return set()
+    keys = set()
+    for _, r in df.iterrows():
+        keys.add(
+            (
+                str(r.get("Prompt", "")).strip(),
+                str(r.get("Answer", "")).strip(),
+                str(r.get("Model", "")).strip(),
+                str(r.get("Funnel", "")).strip(),
+                str(r.get("RunId", "")).strip(),
+            )
+        )
+    return keys
+
+
+def build_response_table(raw_df: pd.DataFrame) -> pd.DataFrame:
+    # Create one row per model response (no citations).
+    rows = []
+    for _, r in raw_df.iterrows():
+        if str(r.get("chatgpt_response", "")).strip():
+            rows.append(
+                {
+                    "RunId": r.get("run_id", ""),
+                    "Funnel": r.get("funnel", ""),
+                    "Geography": r.get("geography", ""),
+                    "Category": r.get("category", ""),
+                    "Prompt": r.get("original_query", ""),
+                    "Full_Prompt": r.get("full_query", ""),
+                    "Model": "chatgpt",
+                    "Answer": str(r.get("chatgpt_response", "")),
+                }
+            )
+        if str(r.get("gemini_response", "")).strip() and "ERROR" not in str(r.get("gemini_response", "")).upper():
+            rows.append(
+                {
+                    "RunId": r.get("run_id", ""),
+                    "Funnel": r.get("funnel", ""),
+                    "Geography": r.get("geography", ""),
+                    "Category": r.get("category", ""),
+                    "Prompt": r.get("original_query", ""),
+                    "Full_Prompt": r.get("full_query", ""),
+                    "Model": "gemini",
+                    "Answer": str(r.get("gemini_response", "")),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def run_response_scoring():
+    # Stage 4: Score overall responses for Vancouver brand criteria.
+    _, _, judge_client = get_clients()
+
+    file_pairs = [
+        (RAW_OUTPUTS["high"], RESPONSE_EVAL_OUTPUTS["high"], RESPONSE_EVAL_PER_RUN_OUTPUTS["high"], "High Funnel"),
+        (RAW_OUTPUTS["mid"], RESPONSE_EVAL_OUTPUTS["mid"], RESPONSE_EVAL_PER_RUN_OUTPUTS["mid"], "Mid Funnel"),
+        (RAW_OUTPUTS["low"], RESPONSE_EVAL_OUTPUTS["low"], RESPONSE_EVAL_PER_RUN_OUTPUTS["low"], "Low Funnel"),
+        (RAW_OUTPUTS["all"], RESPONSE_EVAL_OUTPUTS["combined"], RESPONSE_EVAL_PER_RUN_OUTPUTS["combined"], "Combined"),
+    ]
+
+    for input_file, output_file, per_run_output, name in file_pairs:
+        if not os.path.exists(input_file):
+            logging.warning("Skipping %s (not found)", input_file)
+            continue
+
+        raw_df = pd.read_csv(input_file)
+        response_df = build_response_table(raw_df)
+        logging.info("Loaded %s response rows for %s", len(response_df), name)
+
+        existing_keys = _load_existing_response_keys(per_run_output) if per_run_output else set()
+        if existing_keys:
+            before = len(response_df)
+            response_df = response_df[~response_df.apply(lambda r: _response_key(r), axis=1).isin(existing_keys)]
+            logging.info("Skipped %s already-scored responses", before - len(response_df))
+
+        if len(response_df) == 0:
+            logging.info("No new responses to score for %s", name)
+            continue
+
+        response_df = add_response_metrics(response_df, judge_client)
+
+        # Persist per-run response judgments for caching.
+        if per_run_output:
+            if os.path.exists(per_run_output):
+                existing = pd.read_csv(per_run_output)
+                response_df = pd.concat([existing, response_df], ignore_index=True)
+            response_df.to_csv(per_run_output, index=False)
+            logging.info("Saved per-run response scores to %s", per_run_output)
+
+        # Aggregate across runs
+        group_cols = [
+            "Funnel",
+            "Geography",
+            "Category",
+            "Prompt",
+            "Full_Prompt",
+            "Model",
+        ]
+        agg_cols = [
+            "sentiment",
+            "specificity",
+            "brand_alignment",
+            "ResponseScoreAvg",
+            "VancouverMentions",
+        ]
+        avg_df = response_df.groupby(group_cols, dropna=False)[agg_cols].mean().reset_index()
+        avg_df["RunCount"] = response_df.groupby(group_cols, dropna=False).size().values
+
+        export_response_csv(avg_df, output_file, name)
+
+
 def run_all():
     # Full pipeline in order: raw responses -> per-source tables -> judging.
     generate_raw_responses()
     build_table_views()
     run_judging()
+    run_response_scoring()
 
 
 if __name__ == "__main__":
