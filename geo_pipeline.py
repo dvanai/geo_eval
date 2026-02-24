@@ -1278,7 +1278,8 @@ def run_offline_from_raw():
 
 if __name__ == "__main__":
     # Default to offline behavior in this copy.
-    mode = os.environ.get("GEO_MODE", "offline").lower().strip()
+    mode = os.environ.get("GEO_MODE", "all").lower().strip()
     if mode == "all":
         generate_raw_responses()
     run_all()
+
