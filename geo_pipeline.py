@@ -28,7 +28,9 @@ INPUT_CSV = "queries.csv"
 CHATGPT_MODEL = os.environ.get("CHATGPT_MODEL", "gpt-5.2")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
 JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "gpt-4o")
-RUNS = int(os.environ.get("GEO_RUNS", "1"))
+# Simple pacing for judge API calls (seconds between requests).
+JUDGE_SLEEP_SECONDS = float(os.environ.get("JUDGE_SLEEP_SECONDS", "0"))
+RUNS = 1
 
 RAW_OUTPUTS = {
     "high": "high_funnel_responses.csv",
@@ -128,7 +130,7 @@ def load_queries(csv_path: str) -> dict:
 def create_location_context(geography: str) -> str:
     # Provide geographic context so responses can be localized.
     if pd.isna(geography) or str(geography).lower() == "all":
-        return "You are responding to a global traveler with no specific location bias."
+        return ""
 
     location_contexts = {
         "Los Angeles": "You are helping someone currently located in Los Angeles, California, USA. Consider local context, events, and preferences when relevant.",
@@ -153,11 +155,10 @@ def call_chatgpt(client: OpenAI, full_query: str, geography: str) -> str:
             messages=[
                 {
                     "role": "system",
-                    "content": f"{location_context}\n\nYou are a helpful travel assistant. Provide sources where applicable.",
+                    "content": f"{location_context}\n\nProvide sources where applicable.",
                 },
                 {"role": "user", "content": full_query},
-            ],
-            temperature=0.2,
+            ]
         )
         return completion.choices[0].message.content.strip()
 
@@ -177,11 +178,10 @@ def call_gemini(client: OpenAI, full_query: str, geography: str) -> str:
             messages=[
                 {
                     "role": "system",
-                    "content": f"{location_context}\n\nYou are a helpful travel assistant. Provide sources where applicable.",
+                    "content": f"{location_context}\n\nProvide sources where applicable.",
                 },
                 {"role": "user", "content": full_query},
-            ],
-            temperature=0.2,
+            ]
         )
         return completion.choices[0].message.content.strip()
 
@@ -334,11 +334,48 @@ def domain_from_url(url: str) -> str:
         return ""
 
 
-def extract_source_snippet(answer: str, url: str, window_words: int = 25) -> str:
-    # Pull a small window of words around the URL to approximate the cited snippet.
-    if not answer or not url:
+def extract_source_snippet(answer: str, citation: str = "", url: str = "", window_words: int = 25) -> str:
+    # Prefer section-scoped text tied to a source line in structured answers.
+    if not answer:
         return ""
-    tokens = answer.split()
+
+    answer_text = str(answer)
+
+    # 1) Section-based extraction: section starting at "##" or "###" that contains the URL.
+    if url:
+        try:
+            headings = [m.start() for m in re.finditer(r"(?m)^##{2,3}\\s+.*$", answer_text)]
+            if headings:
+                headings.append(len(answer_text))
+                for i in range(len(headings) - 1):
+                    section = answer_text[headings[i] : headings[i + 1]]
+                    if url in section:
+                        # Cut the section at the first Source line (snippet ends before next snippet start).
+                        lines = section.splitlines()
+                        cut_idx = None
+                        for j, line in enumerate(lines):
+                            if re.search(r"(?i)^\\s*\\*?\\s*\\*\\*Source:\\*\\*.*$", line):
+                                cut_idx = j
+                                break
+                        if cut_idx is not None:
+                            section = "\n".join(lines[:cut_idx])
+                        cleaned = section.strip()
+                        if cleaned:
+                            return cleaned
+        except Exception:
+            pass
+
+    # 2) Sentence(s) containing the citation marker (e.g., [1]).
+    if citation:
+        sentences = re.split(r"(?<=[.!?])\\s+", answer_text.strip())
+        cited = [s for s in sentences if citation in s]
+        if cited:
+            return " ".join(cited).strip()
+
+    # 3) Fallback: pull a small window of words around the URL.
+    if not url:
+        return ""
+    tokens = answer_text.split()
     idx = None
     for i, tok in enumerate(tokens):
         if url in tok:
@@ -369,7 +406,6 @@ def process_funnel_data(df_funnel: pd.DataFrame, funnel_name: str | None = None)
             if not urls:
                 rows.append(
                     {
-                        "RunId": r.get("run_id", ""),
                         "Funnel": r.get("funnel", ""),
                         "Geography": r.get("geography", ""),
                         "Category": r.get("category", ""),
@@ -385,10 +421,10 @@ def process_funnel_data(df_funnel: pd.DataFrame, funnel_name: str | None = None)
                 )
             else:
                 for i, url in enumerate(urls, start=1):
-                    snippet = extract_source_snippet(chatgpt_response, url)
+                    citation = f"[{i}]"
+                    snippet = extract_source_snippet(chatgpt_response, citation=citation, url=url)
                     rows.append(
                         {
-                            "RunId": r.get("run_id", ""),
                             "Funnel": r.get("funnel", ""),
                             "Geography": r.get("geography", ""),
                             "Category": r.get("category", ""),
@@ -398,7 +434,7 @@ def process_funnel_data(df_funnel: pd.DataFrame, funnel_name: str | None = None)
                             "SourceSnippet": snippet,
                             "Model": "chatgpt",
                             "Source": domain_from_url(url),
-                            "Citation": f"[{i}]",
+                            "Citation": citation,
                             "URL": url,
                         }
                     )
@@ -408,7 +444,6 @@ def process_funnel_data(df_funnel: pd.DataFrame, funnel_name: str | None = None)
             if not urls:
                 rows.append(
                     {
-                        "RunId": r.get("run_id", ""),
                         "Funnel": r.get("funnel", ""),
                         "Geography": r.get("geography", ""),
                         "Category": r.get("category", ""),
@@ -424,10 +459,10 @@ def process_funnel_data(df_funnel: pd.DataFrame, funnel_name: str | None = None)
                 )
             else:
                 for i, url in enumerate(urls, start=1):
-                    snippet = extract_source_snippet(gemini_response, url)
+                    citation = f"[{i}]"
+                    snippet = extract_source_snippet(gemini_response, citation=citation, url=url)
                     rows.append(
                         {
-                            "RunId": r.get("run_id", ""),
                             "Funnel": r.get("funnel", ""),
                             "Geography": r.get("geography", ""),
                             "Category": r.get("category", ""),
@@ -437,7 +472,7 @@ def process_funnel_data(df_funnel: pd.DataFrame, funnel_name: str | None = None)
                             "SourceSnippet": snippet,
                             "Model": "gemini",
                             "Source": domain_from_url(url),
-                            "Citation": f"[{i}]",
+                            "Citation": citation,
                             "URL": url,
                         }
                     )
@@ -468,7 +503,6 @@ def build_table_views():
     combined_out = process_funnel_data(combined_df, "Combined")
 
     output_columns = [
-        "RunId",
         "Funnel",
         "Geography",
         "Category",
@@ -507,13 +541,14 @@ def build_table_views():
 
 SUBJECTIVE_KEYS = [
     "diversity",
-    "follow",
     "influence",
     "relevance",
     "subjcount",
-    "subjpos",
     "uniqueness",
 ]
+
+# Legacy subjective keys removed for current pipeline.
+LEGACY_SUBJECTIVE_KEYS = []
 
 RESPONSE_KEYS = [
     "sentiment",
@@ -526,92 +561,99 @@ You are evaluating how a single citation (Source [x]) contributes to a large lan
 
 Rate Source [x] on seven metrics from 0 to 5 (integers only):
 1) Diversity of Ideas (diversity)
-- How broad is the range of ideas or topics that Source [x] contributes to the answer?
-- 0 = not cited or adds almost no new ideas.
-- 5 = cited and adds a wide range of ideas, giving a comprehensive, balanced view.
+Evaluation Criteria:
 
-2) Follow-Up Likelihood (follow)
-- How likely is a user to click the citation / visit this URL for more information?
-- 0 = not cited or not engaging.
-- 5 = highly engaging and very likely to prompt a click.
+Diversity of Ideas (1-5) - the range of different ideas or topics discussed in the citation. This dimension expects to see how much the source contributes to a comprehensive and balanced answer to the user's query.
 
-3) Influence of Citation (influence)
-- How much does the quality, completeness, and coherence of the answer depend on Source [x]?
-- 0 = not cited or answer would be almost the same without it.
-- 5 = central to making the answer correct, coherent, and complete.
+Evaluation Steps:
 
-4) Relevance of Citation to Query (relevance)
-- How directly does Source [x] address the user’s query with precise, clear, useful info?
-- 0 = not cited or basically irrelevant.
-- 5 = highly relevant, precise, clear, and useful.
+1. Read the query and generated answer carefully, noting the major points raised in the answer.
+2. Read the sentences of Source [x] and assess the breadth of ideas or topics they cover and how they contribute to a comprehensive and balanced answer.
+3. Assign a score for Diversity on a scale of 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
+4. 1 indicates that the Source [x] is not cited or does not discuss a diverse range of ideas or topics. 5 indicates that the Source [x] is cited and discusses a wide range of ideas or topics, contributing to a comprehensive and balanced answer. A number in between indicates the degree of diversity of the citation. For example, 3 would mean that Source [x] is cited, with some diversity of ideas or topics, but it is not particularly comprehensive or balanced.
 
-5) Subjective Count / Remembrance (subjcount)
-- How much content in the answer feels like it comes from Source [x], and how memorable is it?
-- 0 = not cited or barely contributes to understanding or memory.
-- 5 = contributes a lot of content and is particularly memorable.
 
-6) Subjective Position (subjpos)
-- How likely is a typical user to encounter this citation while reading the answer (perceived prominence)?
-- 0 = not cited or tucked away where the user is unlikely to see it.
-- 5 = highly prominent; the user is almost certain to see it.
 
-7) Uniqueness in Response (uniqueness)
-- How different is the information from Source [x] compared with other sources used in the answer?
-- 0 = not cited or redundant with other sources.
-- 5 = clearly unique information that stands out from other sources.
+2) Influence of Citation (influence)
+Evaluation Criteria:
 
-Evaluation process:
-1. Read the query and generated answer.
-2. Focus on the parts of the answer that appear to rely on Source [x] (the citation token and its URL).
-3. Consider the seven criteria above and assign each a score from 0 to 5.
+Influence of Citation (1-5) - the degree to which the answer depends on the citation. This dimension expects to see how much the source contributes to the completeness, coherence, and overall quality of the answer.
 
-Return ONLY a valid JSON object with this exact schema and no extra commentary:
-{
-  "diversity": 0,
-  "follow": 0,
-  "influence": 0,
-  "relevance": 0,
-  "subjcount": 0,
-  "subjpos": 0,
-  "uniqueness": 0
-}
+Evaluation Steps:
+
+1. Read the query and generated answer carefully, noting the major points raised in the answer.
+2. Read the sentences of Source [x] and assess how much they contribute to the completeness, coherence, and overall quality of the answer.
+3. Assign a score for Influence on a scale of 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
+4. 1 indicates that the Source [x] is not cited or does not contribute to the completeness, coherence, or quality of the answer. 5 indicates that the Source [x] is cited and contributes significantly to the completeness, coherence, and quality of the answer. A number in between indicates the degree of influence of the citation. For example, 3 would mean that Source [x] is cited, with some influence on the completeness, coherence, or quality of the answer, but it is not crucial.
+
+
+3) Relevance of Citation to Query (relevance)
+Evaluation Criteria:
+
+Relevance of Citation to Query (1-5) - the degree to which the citation text is directly related to the query. This dimension expects to see how well the source addresses the user's query and provides useful and pertinent information.
+
+Evaluation Steps:
+
+1. Read the query and generated answer carefully, noting the major points raised in the answer.
+2. Read the sentences of Source [x] and assess how directly they answer the user's query. Consider the completeness, precision, clarity, and usefulness of the information provided by Source [x].
+3. Assign a score for Relevance on a scale of 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
+4. 1 indicates that the Source [x] is not cited or provides no relevant information. 5 indicates that the Source [x] is cited and provides highly relevant, complete, precise, clear, and useful information. A number in between indicates the degree of relevance of the information provided by Source [x]. For example, 3 would mean that Source [x] is cited, with some relevant information, but it may not be complete, precise, clear, or particularly useful.
+
+
+4) Subjective Count / Remembrance (subjcount)
+Evaluation Criteria:
+
+Subjective Count/Rememberance (1-5) - the amount of content presented from the citation as perceived by the user on reading. This dimension expects to see how much the source contributes to the user's understanding and memory of the answer.
+
+Evaluation Steps:
+
+1. Read the query and generated answer carefully, noting the major points raised in the answer.
+2. Read the sentences of Source [x] and assess how much content is presented from the citation and how much it contributes to the user's understanding and memory of the answer.
+3. Assign a score for Subjective Count/Rememberance on a scale of 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
+4. 1 indicates that the Source [x] is not cited or does not contribute to the user's understanding or memory of the answer. 5 indicates that the Source [x] is cited and contributes significantly to the user's understanding and memory of the answer. A number in between indicates the degree of subjective count/rememberance. For example, 3 would mean that Source [x] is cited, with some contribution to the user's understanding and memory of the answer, but it is not particularly memorable.
+
+
+5) Uniqueness in Response (uniqueness)
+Evaluation Criteria:
+
+Uniqueness in Response (1-5) - the unique information in answer cited to Source [x]. The dimension expects to see how much impression/visibility the source has on the user reading the generated answer. However, the impression is to be measured only because of visibility and impression.
+
+Evaluation Steps:
+
+1. Read the query and generated answer carefully, the major points raised in the answer.
+2. Read the sentences of Source [x] and compare them to information provided by other Sources [x]. Check how unique is the information provided by Source [x] throughout the answer different from other Sources. 
+3. Assign a score for Uniqueness on a scale of 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
+4. 1 indicates that the Source [x] is not cited. 5 indicates that the Source [x] is cited and the information is unique and different throughout the answer. A number in between indicates the degree of uniqueness of the information provided by Source [x] in the answer. For example, 3 would mean that Source [x] is cited, with some information, but is not significantly different from other Sources [x] cited in the answer. 
 """
 
 RESPONSE_RUBRIC_TEXT = """
-You are evaluating the overall response quality for Destination Vancouver. This is NOT about citations.
+You are evaluating the overall response quality for Vancouver as a traveller destination. This is NOT about citations.
 
 Rate the response on three metrics from 0 to 5 (integers only):
 1) Sentiment (sentiment)
 Definition: How warm, compelling, and emotionally positive is the tone when Vancouver is mentioned?
-5 – Vancouver is mentioned and tone is very warm, vivid, and inviting. Vancouver is framed as inspiring, refreshing, or energizing.
-4 – Vancouver is mentioned and tone is positive; Vancouver is recommended but framed more functionally or grouped with peers.
-3 – Vancouver is mentioned and tone is neutral or factual; Vancouver is mentioned without emotional pull.
-2 – Vancouver is mentioned, but described inaccurately, dismissively, or in a way that conflicts with brand values.
-1 – Vancouver is not mentioned.
+5 - Vancouver is mentioned and tone is very warm, vivid, and inviting. Vancouver is framed as inspiring, refreshing, or energizing.
+4 - Vancouver is mentioned and tone is positive; Vancouver is recommended but framed more functionally or grouped with peers.
+3 - Vancouver is mentioned and tone is neutral or factual; Vancouver is mentioned without emotional pull.
+2 - Vancouver is mentioned, but described inaccurately, dismissively, or in a way that conflicts with brand values.
+1 - Vancouver is not mentioned.
 
 2) Specificity (specificity)
 Definition: Does the response reference real, specific Vancouver places, neighbourhoods, events, or experiences?
-5 – Vancouver is mentioned and there are multiple specific and accurate Vancouver references made (e.g., Stanley Park, cherry blossoms in Queen Elizabeth Park, neighbourhoods, Michelin restaurants).
-4 – Vancouver is mentioned and there is at least one specific Vancouver place, experience, or neighbourhood is named.
-3 – Vancouver is mentioned generally, without concrete detail.
-2 – Vancouver is mentioned but information is inaccurate.
-1 – Vancouver is not mentioned.
+5 - Vancouver is mentioned and there are multiple specific and accurate Vancouver references made (e.g., Stanley Park, cherry blossoms in Queen Elizabeth Park, neighbourhoods, Michelin restaurants).
+4 - Vancouver is mentioned and there is at least one specific Vancouver place, experience, or neighbourhood is named.
+3 - Vancouver is mentioned generally, without concrete detail.
+2 - Vancouver is mentioned but information is inaccurate.
+1 - Vancouver is not mentioned.
 
 3) Brand Alignment (brand_alignment)
 Definition: How well does the response reflect Destination Vancouver’s brand?
 Brand pillars: Effortless, Embracing, Energizing, Fresh, Immersive Outdoors, Converging Cultures, Fresh perspectives, Wellbeing, Invigoration, Nature/Proximity of City to Nature, Culinary, Wellness, Major Events, Unique Neighbourhoods, Arts and Culture.
-5 – Vancouver is mentioned and one or more of the above brand pillars are clearly reflected.
-4 – Vancouver is mentioned and brand themes are touched indirectly.
-3 – Vancouver is mentioned, but brand pillars are not evident.
-2 – Vancouver is mentioned but themes are misaligned with our brand.
-1 – Vancouver is not mentioned.
-
-Return ONLY a valid JSON object with this exact schema and no extra commentary:
-{
-  "sentiment": 0,
-  "specificity": 0,
-  "brand_alignment": 0
-}
+5 - Vancouver is mentioned and one or more of the above brand pillars are clearly reflected.
+4 - Vancouver is mentioned and brand themes are touched indirectly.
+3 - Vancouver is mentioned, but brand pillars are not evident.
+2 - Vancouver is mentioned but themes are misaligned with our brand.
+1 - Vancouver is not mentioned.
 """
 
 
@@ -762,12 +804,15 @@ def add_subjective_metrics(df: pd.DataFrame, judge_client: OpenAI) -> pd.DataFra
     subj_cols = {k: [] for k in SUBJECTIVE_KEYS}
     subj_avg = []
 
+    dry_run = os.environ.get("JUDGE_DRY_RUN", "").strip().lower() in {"1", "true", "yes"}
     logging.info("Judging %s rows with %s...", len(df), JUDGE_MODEL)
     for i, (_, row) in enumerate(df.iterrows(), 1):
         if i % 50 == 0:
             logging.info("Processed %s/%s rows", i, len(df))
 
-        scores = judge_row(judge_client, row)
+        scores = {k: 0 for k in SUBJECTIVE_KEYS} if dry_run else judge_row(judge_client, row)
+        if (not dry_run) and JUDGE_SLEEP_SECONDS > 0:
+            time.sleep(JUDGE_SLEEP_SECONDS)
         vals = []
         for k in SUBJECTIVE_KEYS:
             v = scores.get(k, 0)
@@ -789,18 +834,69 @@ def count_vancouver_mentions(text: str) -> int:
     return len(re.findall(r"\bvancouver\b", text, flags=re.IGNORECASE))
 
 
+OTHER_CITY_PATTERNS = {
+    "sydney",
+    "brisbane",
+    "melbourne",
+    "perth",
+    "san francisco",
+    "sfo",
+    "new york",
+    "nyc",
+    "los angeles",
+    "la",
+    "toronto",
+    "montreal",
+    "victoria",
+    "whistler",
+    "seattle",
+    "chicago",
+    "london",
+    "paris",
+    "tokyo",
+    "singapore",
+    "hong kong",
+    "dubai",
+    "mexico city",
+}
+
+
+def count_other_city_mentions(text: str) -> int:
+    if not isinstance(text, str) or not text:
+        return 0
+    counts = 0
+    for city in OTHER_CITY_PATTERNS:
+        counts += len(re.findall(rf"\\b{re.escape(city)}\\b", text, flags=re.IGNORECASE))
+    # Exclude Vancouver itself if present in list by mistake.
+    counts -= len(re.findall(r"\\bvancouver\\b", text, flags=re.IGNORECASE))
+    return max(0, counts)
+
+
+def _present_cols(df: pd.DataFrame, candidates: list[str], context: str) -> list[str]:
+    present = [c for c in candidates if c in df.columns]
+    missing = [c for c in candidates if c not in df.columns]
+    if missing:
+        logging.warning("Missing columns in %s: %s", context, ", ".join(missing))
+    if not present:
+        raise ValueError(f"No aggregation columns available for {context}")
+    return present
+
+
 def add_response_metrics(df: pd.DataFrame, judge_client: OpenAI) -> pd.DataFrame:
     # Add response-level metrics (brand-focused) from judge model outputs.
     df = df.copy()
     cols = {k: [] for k in RESPONSE_KEYS}
     avg_scores = []
 
+    dry_run = os.environ.get("JUDGE_DRY_RUN", "").strip().lower() in {"1", "true", "yes"}
     logging.info("Judging %s responses with %s...", len(df), JUDGE_MODEL)
     for i, (_, row) in enumerate(df.iterrows(), 1):
         if i % 50 == 0:
             logging.info("Processed %s/%s responses", i, len(df))
 
-        scores = judge_response_row(judge_client, row)
+        scores = {k: 0 for k in RESPONSE_KEYS} if dry_run else judge_response_row(judge_client, row)
+        if (not dry_run) and JUDGE_SLEEP_SECONDS > 0:
+            time.sleep(JUDGE_SLEEP_SECONDS)
         vals = []
         for k in RESPONSE_KEYS:
             v = scores.get(k, 0)
@@ -815,6 +911,7 @@ def add_response_metrics(df: pd.DataFrame, judge_client: OpenAI) -> pd.DataFrame
         df[k] = cols[k]
     df["ResponseScoreAvg"] = avg_scores
     df["VancouverMentions"] = df["Answer"].apply(count_vancouver_mentions)
+    df["OtherCityMentions"] = df["Answer"].apply(count_other_city_mentions)
     return df
 
 
@@ -829,7 +926,7 @@ def export_to_csv(df: pd.DataFrame, path: str, dataset_name: str):
     df["TotalMetric"] = (df["PAWordCount_Norm"] + df["SubjectiveImpressions_Norm"]) / 2
 
     summary = (
-        df.groupby(["Funnel", "Model", "Source"])
+        df.groupby(["Funnel", "Geography", "Category", "Model", "Source"])
         .agg(
             Count=("Source", "size"),
             AvgTotalMetric=("TotalMetric", "mean"),
@@ -845,8 +942,67 @@ def export_to_csv(df: pd.DataFrame, path: str, dataset_name: str):
     summary_path = os.path.splitext(path)[0] + "_summary.csv"
     summary.to_csv(summary_path, index=False)
 
+    # Extra summary: by Source only (no Model/Geography/Category).
+    source_summary = (
+        df.groupby(["Funnel", "Source"])
+        .agg(
+            Count=("Source", "size"),
+            AvgTotalMetric=("TotalMetric", "mean"),
+        )
+        .round(3)
+        .reset_index()
+    )
+    source_summary["RelevanceScore"] = source_summary["Count"] * source_summary["AvgTotalMetric"]
+    source_summary_path = os.path.splitext(path)[0] + "_summary_source.csv"
+    source_summary.to_csv(source_summary_path, index=False)
+
+    # Extra summaries: by Geography and by Category (per Source).
+    geo_summary = (
+        df.groupby(["Funnel", "Geography", "Source"])
+        .agg(
+            Count=("Source", "size"),
+            AvgTotalMetric=("TotalMetric", "mean"),
+        )
+        .round(3)
+        .reset_index()
+    )
+    geo_summary["RelevanceScore"] = geo_summary["Count"] * geo_summary["AvgTotalMetric"]
+    geo_summary_path = os.path.splitext(path)[0] + "_summary_geography.csv"
+    geo_summary.to_csv(geo_summary_path, index=False)
+
+    category_summary = (
+        df.groupby(["Funnel", "Category", "Source"])
+        .agg(
+            Count=("Source", "size"),
+            AvgTotalMetric=("TotalMetric", "mean"),
+        )
+        .round(3)
+        .reset_index()
+    )
+    category_summary["RelevanceScore"] = category_summary["Count"] * category_summary["AvgTotalMetric"]
+    category_summary_path = os.path.splitext(path)[0] + "_summary_category.csv"
+    category_summary.to_csv(category_summary_path, index=False)
+
+    # Extra summary: by URL (per Source).
+    url_summary = (
+        df.groupby(["Funnel", "Source", "URL"])
+        .agg(
+            Count=("URL", "size"),
+            AvgTotalMetric=("TotalMetric", "mean"),
+        )
+        .round(3)
+        .reset_index()
+    )
+    url_summary["RelevanceScore"] = url_summary["Count"] * url_summary["AvgTotalMetric"]
+    url_summary_path = os.path.splitext(path)[0] + "_summary_url.csv"
+    url_summary.to_csv(url_summary_path, index=False)
+
     logging.info("Saved %s rows to %s (%s)", len(df), path, dataset_name)
     logging.info("Saved summary to %s", summary_path)
+    logging.info("Saved source summary to %s", source_summary_path)
+    logging.info("Saved geography summary to %s", geo_summary_path)
+    logging.info("Saved category summary to %s", category_summary_path)
+    logging.info("Saved url summary to %s", url_summary_path)
 
 
 def export_response_csv(df: pd.DataFrame, path: str, dataset_name: str):
@@ -856,7 +1012,7 @@ def export_response_csv(df: pd.DataFrame, path: str, dataset_name: str):
     summary = (
         df.groupby(["Funnel", "Model"])
         .agg(
-            Count=("Answer", "size"),
+            Count=("ResponseScoreAvg", "size"),
             AvgResponseScore=("ResponseScoreAvg", "mean"),
             AvgVancouverMentions=("VancouverMentions", "mean"),
         )
@@ -871,41 +1027,86 @@ def export_response_csv(df: pd.DataFrame, path: str, dataset_name: str):
     logging.info("Saved %s rows to %s (%s)", len(df), path, dataset_name)
     logging.info("Saved response summary to %s", summary_path)
 
-
-def _eval_key(row: dict) -> tuple:
-    # Minimal unique key to avoid re-judging the same citation row.
-    return (
-        str(row.get("Prompt", "")).strip(),
-        str(row.get("Answer", "")).strip(),
-        str(row.get("Citation", "")).strip(),
-        str(row.get("URL", "")).strip(),
-        str(row.get("Model", "")).strip(),
-        str(row.get("Funnel", "")).strip(),
-        str(row.get("RunId", "")).strip(),
-    )
-
-
-def _load_existing_eval_keys(output_file: str) -> set[tuple]:
-    if not os.path.exists(output_file):
-        return set()
-    try:
-        df = pd.read_csv(output_file)
-    except Exception:
-        return set()
-    keys = set()
-    for _, r in df.iterrows():
-        keys.add(
-            (
-                str(r.get("Prompt", "")).strip(),
-                str(r.get("Answer", "")).strip(),
-                str(r.get("Citation", "")).strip(),
-                str(r.get("URL", "")).strip(),
-                str(r.get("Model", "")).strip(),
-                str(r.get("Funnel", "")).strip(),
-                str(r.get("RunId", "")).strip(),
-            )
+    # Extra summaries: by Geography and by Category (per Model).
+    geo_summary = (
+        df.groupby(["Funnel", "Geography", "Model"])
+        .agg(
+            Count=("ResponseScoreAvg", "size"),
+            AvgResponseScore=("ResponseScoreAvg", "mean"),
+            AvgVancouverMentions=("VancouverMentions", "mean"),
+            AvgOtherCityMentions=("OtherCityMentions", "mean"),
         )
-    return keys
+        .round(3)
+        .reset_index()
+    )
+    geo_summary_path = os.path.splitext(path)[0] + "_summary_geography.csv"
+    geo_summary.to_csv(geo_summary_path, index=False)
+
+    category_summary = (
+        df.groupby(["Funnel", "Category", "Model"])
+        .agg(
+            Count=("ResponseScoreAvg", "size"),
+            AvgResponseScore=("ResponseScoreAvg", "mean"),
+            AvgVancouverMentions=("VancouverMentions", "mean"),
+            AvgOtherCityMentions=("OtherCityMentions", "mean"),
+        )
+        .round(3)
+        .reset_index()
+    )
+    category_summary_path = os.path.splitext(path)[0] + "_summary_category.csv"
+    category_summary.to_csv(category_summary_path, index=False)
+
+    logging.info("Saved response geography summary to %s", geo_summary_path)
+    logging.info("Saved response category summary to %s", category_summary_path)
+
+    # Combined summaries across funnels (no Funnel column).
+    combined_summary = (
+        df.groupby(["Model"])
+        .agg(
+            Count=("ResponseScoreAvg", "size"),
+            AvgResponseScore=("ResponseScoreAvg", "mean"),
+            AvgVancouverMentions=("VancouverMentions", "mean"),
+            AvgOtherCityMentions=("OtherCityMentions", "mean"),
+        )
+        .round(3)
+        .reset_index()
+    )
+    combined_summary_path = os.path.splitext(path)[0] + "_summary_all.csv"
+    combined_summary.to_csv(combined_summary_path, index=False)
+
+    combined_geo_summary = (
+        df.groupby(["Geography", "Model"])
+        .agg(
+            Count=("ResponseScoreAvg", "size"),
+            AvgResponseScore=("ResponseScoreAvg", "mean"),
+            AvgVancouverMentions=("VancouverMentions", "mean"),
+            AvgOtherCityMentions=("OtherCityMentions", "mean"),
+        )
+        .round(3)
+        .reset_index()
+    )
+    combined_geo_summary_path = os.path.splitext(path)[0] + "_summary_all_geography.csv"
+    combined_geo_summary.to_csv(combined_geo_summary_path, index=False)
+
+    combined_category_summary = (
+        df.groupby(["Category", "Model"])
+        .agg(
+            Count=("ResponseScoreAvg", "size"),
+            AvgResponseScore=("ResponseScoreAvg", "mean"),
+            AvgVancouverMentions=("VancouverMentions", "mean"),
+            AvgOtherCityMentions=("OtherCityMentions", "mean"),
+        )
+        .round(3)
+        .reset_index()
+    )
+    combined_category_summary_path = os.path.splitext(path)[0] + "_summary_all_category.csv"
+    combined_category_summary.to_csv(combined_category_summary_path, index=False)
+
+    logging.info("Saved response combined summary to %s", combined_summary_path)
+    logging.info("Saved response combined geography summary to %s", combined_geo_summary_path)
+    logging.info("Saved response combined category summary to %s", combined_category_summary_path)
+
+
 
 
 def run_judging():
@@ -913,13 +1114,13 @@ def run_judging():
     _, _, judge_client = get_clients()
 
     file_pairs = [
-        (TABLE_OUTPUTS["combined"], EVAL_OUTPUTS["combined"], EVAL_PER_RUN_OUTPUTS["combined"], "Combined"),
-        (TABLE_OUTPUTS["high"], EVAL_OUTPUTS["high"], EVAL_PER_RUN_OUTPUTS["high"], "High Funnel"),
-        (TABLE_OUTPUTS["mid"], EVAL_OUTPUTS["mid"], EVAL_PER_RUN_OUTPUTS["mid"], "Mid Funnel"),
-        (TABLE_OUTPUTS["low"], EVAL_OUTPUTS["low"], EVAL_PER_RUN_OUTPUTS["low"], "Low Funnel"),
+        (TABLE_OUTPUTS["combined"], EVAL_OUTPUTS["combined"], "Combined"),
+        (TABLE_OUTPUTS["high"], EVAL_OUTPUTS["high"], "High Funnel"),
+        (TABLE_OUTPUTS["mid"], EVAL_OUTPUTS["mid"], "Mid Funnel"),
+        (TABLE_OUTPUTS["low"], EVAL_OUTPUTS["low"], "Low Funnel"),
     ]
 
-    for input_file, output_file, per_run_output, name in file_pairs:
+    for input_file, output_file, name in file_pairs:
         if not os.path.exists(input_file):
             logging.warning("Skipping %s (not found)", input_file)
             continue
@@ -928,13 +1129,6 @@ def run_judging():
         df = pd.read_csv(input_file)
         logging.info("Loaded %s rows", len(df))
 
-        # Skip already-judged rows to minimize API calls.
-        existing_keys = _load_existing_eval_keys(per_run_output) if per_run_output else set()
-        if existing_keys:
-            before = len(df)
-            df = df[~df.apply(lambda r: _eval_key(r), axis=1).isin(existing_keys)]
-            logging.info("Skipped %s already-judged rows", before - len(df))
-
         if len(df) == 0:
             logging.info("No new rows to judge for %s", name)
             continue
@@ -942,13 +1136,14 @@ def run_judging():
         df = add_objective_metrics(df)
         df = add_subjective_metrics(df, judge_client)
 
-        # Persist per-run judgments for caching.
-        if per_run_output:
-            if os.path.exists(per_run_output):
-                existing_per_run = pd.read_csv(per_run_output)
-                df = pd.concat([existing_per_run, df], ignore_index=True)
-            df.to_csv(per_run_output, index=False)
-            logging.info("Saved per-run judgments to %s", per_run_output)
+        # Backward compatibility: older cached runs may use legacy subjective keys.
+        subjective_cols = [c for c in (SUBJECTIVE_KEYS + LEGACY_SUBJECTIVE_KEYS) if c in df.columns]
+        if "SubjectiveImpressions" not in df.columns:
+            if subjective_cols:
+                df["SubjectiveImpressions"] = df[subjective_cols].mean(axis=1)
+            else:
+                logging.warning("No subjective columns found; defaulting SubjectiveImpressions to 0.")
+                df["SubjectiveImpressions"] = 0.0
 
         # Aggregate across runs and compute averaged scores.
         group_cols = [
@@ -957,24 +1152,24 @@ def run_judging():
             "Category",
             "Prompt",
             "Full_Prompt",
+            "Answer",
             "Model",
             "Source",
             "Citation",
             "URL",
         ]
-        agg_cols = [
+        agg_candidates = [
             "WordCount",
             "PositionWeight",
             "PAWordCount",
             "diversity",
-            "follow",
             "influence",
             "relevance",
             "subjcount",
-            "subjpos",
             "uniqueness",
             "SubjectiveImpressions",
         ]
+        agg_cols = _present_cols(df, agg_candidates, f"{name} judging")
 
         avg_df = df.groupby(group_cols, dropna=False)[agg_cols].mean().reset_index()
         avg_df["RunCount"] = df.groupby(group_cols, dropna=False).size().values
@@ -985,35 +1180,6 @@ def run_judging():
         export_to_csv(avg_df, output_file, name)
 
 
-def _response_key(row: dict) -> tuple:
-    return (
-        str(row.get("Prompt", "")).strip(),
-        str(row.get("Answer", "")).strip(),
-        str(row.get("Model", "")).strip(),
-        str(row.get("Funnel", "")).strip(),
-        str(row.get("RunId", "")).strip(),
-    )
-
-
-def _load_existing_response_keys(output_file: str) -> set[tuple]:
-    if not os.path.exists(output_file):
-        return set()
-    try:
-        df = pd.read_csv(output_file)
-    except Exception:
-        return set()
-    keys = set()
-    for _, r in df.iterrows():
-        keys.add(
-            (
-                str(r.get("Prompt", "")).strip(),
-                str(r.get("Answer", "")).strip(),
-                str(r.get("Model", "")).strip(),
-                str(r.get("Funnel", "")).strip(),
-                str(r.get("RunId", "")).strip(),
-            )
-        )
-    return keys
 
 
 def build_response_table(raw_df: pd.DataFrame) -> pd.DataFrame:
@@ -1023,7 +1189,6 @@ def build_response_table(raw_df: pd.DataFrame) -> pd.DataFrame:
         if str(r.get("chatgpt_response", "")).strip():
             rows.append(
                 {
-                    "RunId": r.get("run_id", ""),
                     "Funnel": r.get("funnel", ""),
                     "Geography": r.get("geography", ""),
                     "Category": r.get("category", ""),
@@ -1036,7 +1201,6 @@ def build_response_table(raw_df: pd.DataFrame) -> pd.DataFrame:
         if str(r.get("gemini_response", "")).strip() and "ERROR" not in str(r.get("gemini_response", "")).upper():
             rows.append(
                 {
-                    "RunId": r.get("run_id", ""),
                     "Funnel": r.get("funnel", ""),
                     "Geography": r.get("geography", ""),
                     "Category": r.get("category", ""),
@@ -1054,13 +1218,13 @@ def run_response_scoring():
     _, _, judge_client = get_clients()
 
     file_pairs = [
-        (RAW_OUTPUTS["high"], RESPONSE_EVAL_OUTPUTS["high"], RESPONSE_EVAL_PER_RUN_OUTPUTS["high"], "High Funnel"),
-        (RAW_OUTPUTS["mid"], RESPONSE_EVAL_OUTPUTS["mid"], RESPONSE_EVAL_PER_RUN_OUTPUTS["mid"], "Mid Funnel"),
-        (RAW_OUTPUTS["low"], RESPONSE_EVAL_OUTPUTS["low"], RESPONSE_EVAL_PER_RUN_OUTPUTS["low"], "Low Funnel"),
-        (RAW_OUTPUTS["all"], RESPONSE_EVAL_OUTPUTS["combined"], RESPONSE_EVAL_PER_RUN_OUTPUTS["combined"], "Combined"),
+        (RAW_OUTPUTS["high"], RESPONSE_EVAL_OUTPUTS["high"], "High Funnel"),
+        (RAW_OUTPUTS["mid"], RESPONSE_EVAL_OUTPUTS["mid"], "Mid Funnel"),
+        (RAW_OUTPUTS["low"], RESPONSE_EVAL_OUTPUTS["low"], "Low Funnel"),
+        (RAW_OUTPUTS["all"], RESPONSE_EVAL_OUTPUTS["combined"], "Combined"),
     ]
 
-    for input_file, output_file, per_run_output, name in file_pairs:
+    for input_file, output_file, name in file_pairs:
         if not os.path.exists(input_file):
             logging.warning("Skipping %s (not found)", input_file)
             continue
@@ -1069,55 +1233,52 @@ def run_response_scoring():
         response_df = build_response_table(raw_df)
         logging.info("Loaded %s response rows for %s", len(response_df), name)
 
-        existing_keys = _load_existing_response_keys(per_run_output) if per_run_output else set()
-        if existing_keys:
-            before = len(response_df)
-            response_df = response_df[~response_df.apply(lambda r: _response_key(r), axis=1).isin(existing_keys)]
-            logging.info("Skipped %s already-scored responses", before - len(response_df))
-
         if len(response_df) == 0:
             logging.info("No new responses to score for %s", name)
             continue
 
         response_df = add_response_metrics(response_df, judge_client)
 
-        # Persist per-run response judgments for caching.
-        if per_run_output:
-            if os.path.exists(per_run_output):
-                existing = pd.read_csv(per_run_output)
-                response_df = pd.concat([existing, response_df], ignore_index=True)
-            response_df.to_csv(per_run_output, index=False)
-            logging.info("Saved per-run response scores to %s", per_run_output)
-
-        # Aggregate across runs
-        group_cols = [
+        # Single-run output (no aggregation)
+        if "Prompt" in response_df.columns:
+            response_df = response_df.drop(columns=["Prompt"])
+        ordered_cols = [
             "Funnel",
             "Geography",
             "Category",
-            "Prompt",
             "Full_Prompt",
+            "Answer",
             "Model",
-        ]
-        agg_cols = [
             "sentiment",
             "specificity",
             "brand_alignment",
             "ResponseScoreAvg",
             "VancouverMentions",
+            "OtherCityMentions",
         ]
-        avg_df = response_df.groupby(group_cols, dropna=False)[agg_cols].mean().reset_index()
-        avg_df["RunCount"] = response_df.groupby(group_cols, dropna=False).size().values
+        available_cols = [c for c in ordered_cols if c in response_df.columns]
+        response_df = response_df[available_cols + [c for c in response_df.columns if c not in available_cols]]
 
-        export_response_csv(avg_df, output_file, name)
+        export_response_csv(response_df, output_file, name)
 
 
 def run_all():
-    # Full pipeline in order: raw responses -> per-source tables -> judging.
-    generate_raw_responses()
+    # Offline-first pipeline: use existing raw CSVs and skip API calls.
+    build_table_views()
+    run_judging()
+    run_response_scoring()
+
+
+def run_offline_from_raw():
+    # Offline mode: use existing raw CSVs and skip API calls for generation.
     build_table_views()
     run_judging()
     run_response_scoring()
 
 
 if __name__ == "__main__":
+    # Default to offline behavior in this copy.
+    mode = os.environ.get("GEO_MODE", "offline").lower().strip()
+    if mode == "all":
+        generate_raw_responses()
     run_all()
